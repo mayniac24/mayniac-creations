@@ -44,10 +44,18 @@ jobs:
         # Runs even when publishing failed -- the failure record must survive.
         if: always()
         run: |
-          git add queue data/gallery.json
-          git diff --staged --quiet || git commit -m "publish: record outcome"
-          git pull --rebase --autostash
-          git push
+          # -A so a deleted or added queue file is staged too. The paths are
+          # kept alive by .gitkeep -- git does not track empty directories, and
+          # without them `git add queue` is a fatal pathspec error on a fresh
+          # checkout with an empty queue.
+          git add -A queue data/gallery.json
+          if git diff --staged --quiet; then
+            echo "nothing to record"
+          else
+            git commit -m "publish: record outcome"
+            git pull --rebase --autostash
+            git push
+          fi
 
       - name: Dead man's switch
         # Alerts on ABSENCE, which is the failure class GitHub cannot report:

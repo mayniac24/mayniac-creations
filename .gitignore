@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Local editor/agent scratch -- never belongs in a public repo
+.claude/
