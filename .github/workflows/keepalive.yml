@@ -1,0 +1,27 @@
+name: keepalive
+
+# Scheduled workflows auto-disable after 60 days of repository inactivity on
+# public repos. The queue is often empty, which means no commits, which
+# disables the publish cron -- with no failed run to notice. One weekly commit
+# resets the inactivity clock.
+on:
+  schedule:
+    - cron: '11 14 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git config user.name mayniac-bot
+          git config user.email mayniac24@protonmail.com
+          git add .keepalive
+          git commit -m "chore: keepalive"
+          git push

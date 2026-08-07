@@ -1,0 +1,78 @@
+name: publish
+
+on:
+  schedule:
+    # Offset minutes, never */15 -- the top of the hour is GitHub's documented
+    # congestion peak and scheduled runs there get delayed or dropped.
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+
+# Prevents overlap only. NOT crash recovery, and a cancelled run sends no
+# email -- so nothing here may be load-bearing on it.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+
+      - name: Configure git
+        run: |
+          git config user.name mayniac-bot
+          git config user.email mayniac24@protonmail.com
+
+      - name: Publish due entry
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+        run: python scripts/publish.py
+
+      - name: Commit outcome
+        # Runs even when publishing failed -- the failure record must survive.
+        if: always()
+        run: |
+          git add queue data/gallery.json
+          git diff --staged --quiet || git commit -m "publish: record outcome"
+          git pull --rebase --autostash
+          git push
+
+      - name: Dead man's switch
+        # Alerts on ABSENCE, which is the failure class GitHub cannot report:
+        # a cron auto-disabled by inactivity, a cancelled run, a green no-op.
+        if: always()
+        run: curl -fsS -m 10 --retry 3 "${{ secrets.HEALTHCHECK_URL }}"
+
+  deploy:
+    # MUST live inside this workflow. A push made with GITHUB_TOKEN does not
+    # trigger push-triggered workflows, so a separate deploy.yml would leave the
+    # gallery permanently stale with a green run and no email.
+    needs: publish
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: .
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
