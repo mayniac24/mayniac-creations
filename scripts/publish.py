@@ -185,7 +185,21 @@ def save_entry(path: str, entry: dict) -> None:
                        default_flow_style=False)
 
 
+def wants_gallery(entry: dict) -> bool:
+    """A queue entry opts out of the artwork gallery with `gallery: false`.
+
+    Photographs (`content_class: photo`) are queued that way: the gallery is
+    the artwork site, and a hiking photograph must not appear in it. Every
+    existing entry carries a gallery mapping, so absence of the key or a
+    mapping keeps today's behaviour.
+    """
+    return entry.get("gallery") is not False
+
+
 def append_gallery(entries: list[dict]) -> None:
+    entries = [e for e in entries if wants_gallery(e)]
+    if not entries:
+        return
     with open(GALLERY, encoding="utf-8") as fh:
         data = json.load(fh)
     known = {p.get("permalink") for p in data["pieces"]}

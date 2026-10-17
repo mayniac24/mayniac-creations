@@ -261,6 +261,37 @@ def test_not_due_entry_without_faces_is_untouched():
     check(published == [] and e == before, "a future entry is left exactly as it was")
 
 
+def test_a_photo_entry_skips_the_gallery():
+    """`gallery: false` is how queue_post.py --kind photo says "not artwork":
+    the entry publishes to Instagram but never reaches data/gallery.json."""
+    import json
+    import tempfile
+    photo = entry("hike-photo", NOW - timedelta(minutes=5), post_id="p-photo",
+                  gallery=False, content_class="photo")
+    art = entry("an-artwork", NOW - timedelta(minutes=5), post_id="p-art")
+    check(publish.wants_gallery(photo) is False, "gallery: false opts out")
+    check(publish.wants_gallery(art) is True, "a gallery mapping opts in")
+    check(publish.wants_gallery({"slug": "old"}) is True,
+          "an old entry with no gallery key keeps the old behaviour")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "gallery.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"pieces": []}, fh)
+        old = publish.GALLERY
+        publish.GALLERY = path
+        try:
+            publish.append_gallery([photo])
+            with open(path, encoding="utf-8") as fh:
+                check(json.load(fh)["pieces"] == [], "a photo adds no gallery piece")
+            publish.append_gallery([photo, art])
+            with open(path, encoding="utf-8") as fh:
+                pieces = json.load(fh)["pieces"]
+            check(len(pieces) == 1 and pieces[0]["title"] == "an-artwork",
+                  "an artwork queued beside a photo still lands")
+        finally:
+            publish.GALLERY = old
+
+
 def main():
     test_selects_only_due_scheduled_entries()
     test_earliest_first_and_one_per_run()
@@ -279,6 +310,7 @@ def main():
     test_refused_entry_does_not_block_the_next_due_one_or_repeat()
     test_due_entry_with_faces_passed_publishes_as_before()
     test_not_due_entry_without_faces_is_untouched()
+    test_a_photo_entry_skips_the_gallery()
     print(f"\n{PASSED} checks passed")
 
 
