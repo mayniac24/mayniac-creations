@@ -34,6 +34,7 @@ def entry(slug, when, **over):
     e = {"slug": slug, "artwork_id": "001", "scheduled_for": when,
          "media_type": "IMAGE", "media": [f"publish/{slug}.jpg"],
          "caption": f'"{slug}"\n\nbody\n\n#art', "media_url": f"https://x/{slug}.jpg",
+         "faces": "passed",
          "status": "scheduled", "creation_id": None, "post_id": None,
          "published_at": None, "error": None,
          "gallery": {"id": "001", "title": slug, "year": 2026, "series": None,
@@ -206,6 +207,60 @@ def test_gallery_append_is_a_strict_allowlist():
         check(leak not in blob, f"no {leak} in the published record")
 
 
+def test_due_entry_without_faces_passed_is_refused():
+    """Standing rule 0.6: EVERY publish path guards.
+    queue_post.py writes faces: passed only after its gate; anything else that
+    reaches queue/ (hand edit, another tool) must not be published."""
+    import io
+    import contextlib
+    for label, over in (("missing", None), ("not passed", "refused"),
+                        ("blank", ""), ("passed-ish", "Passed")):
+        e = entry("nofaces", NOW - timedelta(minutes=5))
+        if over is None:
+            del e["faces"]
+        else:
+            e["faces"] = over
+        client = FakeClient()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            published = publish.run([e], client, NOW, dry_run=False)
+        check(published == [] and client.created == [] and client.published == [],
+              f"faces {label}: nothing published, no API call")
+        check(e["status"] == "refused_faces", f"faces {label}: status refused_faces")
+        out = buf.getvalue().strip().splitlines()
+        check(len(out) == 1 and "nofaces.yaml" in out[0] and "no faces: passed" in out[0],
+              f"faces {label}: one log line naming the file and reason")
+
+
+def test_refused_entry_does_not_block_the_next_due_one_or_repeat():
+    bad = entry("bad", NOW - timedelta(hours=3))
+    del bad["faces"]
+    good = entry("good", NOW - timedelta(hours=1))
+    client = FakeClient()
+    published = publish.run([bad, good], client, NOW, dry_run=False)
+    check([e["slug"] for e in published] == ["good"],
+          "an unguarded entry does not use up the one-per-run slot")
+    check(bad["status"] == "refused_faces", "the refused one is parked")
+    check(publish.select_due([bad], NOW) == [],
+          "and is not selected again on the next tick")
+
+
+def test_due_entry_with_faces_passed_publishes_as_before():
+    e = entry("ok", NOW - timedelta(minutes=5), faces="passed")
+    client = FakeClient()
+    published = publish.run([e], client, NOW, dry_run=False)
+    check(len(published) == 1 and client.published == ["c1"], "published via the stub")
+    check(e["status"] == "published" and e["post_id"] == "post-c1", "recorded as before")
+
+
+def test_not_due_entry_without_faces_is_untouched():
+    e = entry("later", NOW + timedelta(days=1))
+    del e["faces"]
+    before = dict(e)
+    published = publish.run([e], FakeClient(), NOW, dry_run=False)
+    check(published == [] and e == before, "a future entry is left exactly as it was")
+
+
 def main():
     test_selects_only_due_scheduled_entries()
     test_earliest_first_and_one_per_run()
@@ -220,6 +275,10 @@ def main():
     test_transient_error_leaves_it_scheduled()
     test_dry_run_makes_no_calls()
     test_gallery_append_is_a_strict_allowlist()
+    test_due_entry_without_faces_passed_is_refused()
+    test_refused_entry_does_not_block_the_next_due_one_or_repeat()
+    test_due_entry_with_faces_passed_publishes_as_before()
+    test_not_due_entry_without_faces_is_untouched()
     print(f"\n{PASSED} checks passed")
 
 

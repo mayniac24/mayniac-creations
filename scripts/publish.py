@@ -125,6 +125,18 @@ def run(entries: list[dict], client, now: datetime, dry_run: bool = False,
         checkpoint=None, sleep=None) -> list[dict]:
     published = []
     for entry in select_due(entries, now):
+        # Standing rule 0.6: every publish path guards. Each path must check the
+        # face gate result before posting. queue_post.py writes faces: passed only
+        # after its gate; an entry that reached queue/ any other way is parked, not
+        # posted. Parking (not just skipping) keeps it from logging every tick; a
+        # human re-runs the gate and resets status to scheduled. `continue` so it
+        # never uses up the one-per-run slot a good entry behind it is waiting for.
+        if entry.get("faces") != "passed":
+            entry["status"] = "refused_faces"
+            entry["error"] = "no faces: passed; face gate was not run on this entry"
+            print(f"refused: queue/{entry.get('slug')}.yaml has no faces: passed "
+                  "(no image is posted unless its face gate passed)")
+            continue
         if now - entry["scheduled_for"] > STALE_AFTER:
             entry["status"] = "stale"
             entry["error"] = "over 24h late; reschedule by hand"
