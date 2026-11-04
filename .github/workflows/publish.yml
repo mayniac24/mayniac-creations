@@ -38,6 +38,9 @@ jobs:
         env:
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          # Facebook Login, for a reel's licensed song only. Unset: reels with music are held, never posted silent.
+          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          FB_IG_USER_ID: ${{ secrets.FB_IG_USER_ID }}
         run: python scripts/publish.py
 
       - name: Commit outcome

@@ -322,9 +322,10 @@ class FakeClientAll(FakeClient):
     def create_carousel_container(self, children, caption):
         return self._new("carousel", children=list(children), caption=caption)
 
-    def create_reel(self, video_url, caption, cover_url=None, thumb_offset=None, share_to_feed=None):
+    def create_reel(self, video_url, caption, cover_url=None, thumb_offset=None, share_to_feed=None,
+                    audio_configuration=None):
         return self._new("reel", url=video_url, caption=caption, cover_url=cover_url, thumb_offset=thumb_offset,
-                         share_to_feed=share_to_feed)
+                         share_to_feed=share_to_feed, audio_configuration=audio_configuration)
 
     def create_story(self, url, kind="image"):
         return self._new("story", url=url, kind=kind)
@@ -343,7 +344,7 @@ def media_entry(slug, media_type, media, **over):
 
 
 def test_the_supports_line_names_every_type():
-    check(set(publish.SUPPORTS) == {"IMAGE", "CAROUSEL", "CAROUSEL_VIDEO", "REELS", "STORIES", "ALT_TEXT"},
+    check(set(publish.SUPPORTS) == {"IMAGE", "CAROUSEL", "CAROUSEL_VIDEO", "REELS", "STORIES", "ALT_TEXT", "MUSIC"},
           "SUPPORTS names every post type (queue_post.py reads it from origin/main)")
 
 
@@ -482,6 +483,211 @@ def test_the_client_sends_what_meta_documents():
     check(bodies[5] == {"media_type": "STORIES", "video_url": "https://i/5.mp4"}, "a story: no caption")
 
 
+# ---------------------------------------------------------------- a reel's song (Audio API, Facebook Login)
+# The song is looked up when the reel publishes (exact artist and title, music only) and attached with
+# audio_configuration through the Facebook Login client. No token or no licensed match: the reel is HELD
+# (music_unavailable), never posted silent unless the entry says allow_silent: true.
+
+class FakeMusicClient(FakeClientAll):
+    """The Facebook Login client: search_audio answers from `catalogue`, or raises `search_error`."""
+
+    def __init__(self, catalogue=None, search_error=None, **kw):
+        super().__init__(**kw)
+        self.catalogue = catalogue or []
+        self.search_error = search_error
+        self.searches = []
+
+    def search_audio(self, query, audio_type="music"):
+        self.searches.append((query, audio_type))
+        if self.search_error:
+            raise self.search_error
+        return list(self.catalogue)
+
+
+NIGHTCALL = {"audio_id": "587784541076604", "title": "Nightcall", "display_artist": "Kavinsky",
+             "duration_in_ms": 258000, "audio_type": "music"}
+
+
+def music_reel(slug="nightcall-reel", **over):
+    e = media_entry(slug, "REELS", [f"publish/{slug}.mp4"], media_kinds=["video"], cover=None, thumb_offset=None,
+                    share_to_feed=True, kind="reel",
+                    music={"artist": "Kavinsky", "title": "Nightcall", "start": "0:10", "start_s": 10, "volume": 80,
+                           "original_volume": 40, "matched_at": "publish", "start_applied": False},
+                    allow_silent=False)
+    e.update(over)
+    return e
+
+
+def quiet_run(entries, client, music_client=None):
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        published = publish.run(entries, client, NOW, sleep=lambda s: None, music_client=music_client)
+    return published, buf.getvalue()
+
+
+def test_a_music_reel_with_no_facebook_token_is_held():
+    e = music_reel()
+    ig = FakeClientAll()
+    published, out = quiet_run([e], ig, music_client=None)
+    check(published == [] and ig.calls == [] and ig.published == [], "nothing created or posted")
+    check(e["status"] == "music_unavailable" and "Facebook Login token" in e["error"] and "never posted silent" in e["error"],
+          "held as music_unavailable, saying why in plain words")
+    check(publish.select_due([e], NOW) == [], "...and not picked up again until a person sets it back to scheduled")
+
+
+def test_a_music_reel_with_no_licensed_match_is_held_and_does_not_block_the_next():
+    e = music_reel()
+    other = media_entry("next-photo", "IMAGE", ["publish/n.jpg"], scheduled_for=NOW - timedelta(minutes=1))
+    near = [dict(NIGHTCALL, title="Nightcall (Remix)"), dict(NIGHTCALL, audio_type="original_sound"),
+            dict(NIGHTCALL, display_artist="Kavinsky & Lovefoxxx")]
+    fb, ig = FakeMusicClient(catalogue=near), FakeClientAll()
+    published, out = quiet_run([e, other], ig, music_client=fb)
+    check(e["status"] == "music_unavailable" and "no exact match" in e["error"], "no exact match: held")
+    check(fb.searches == [("Kavinsky Nightcall", "music")] and fb.calls == [], "one music search, nothing created")
+    check([p["slug"] for p in published] == ["next-photo"], "a held reel does not use up the run's one post")
+
+
+def test_a_music_reel_with_a_match_publishes_through_facebook_with_its_song():
+    e = music_reel()
+    fb = FakeMusicClient(catalogue=[dict(NIGHTCALL, title="  nightcall ", display_artist="KAVINSKY")])
+    ig = FakeClientAll()
+    published, out = quiet_run([e], ig, music_client=fb)
+    check(len(published) == 1 and e["status"] == "published" and e["publish_via"] == "facebook",
+          "published through the Facebook Login client")
+    w, a = fb.calls[0]
+    check(w == "reel" and a["audio_configuration"] == {"audio_id": "587784541076604", "audio_volume": 80,
+                                                        "video_volume": 40},
+          "audio_configuration: the matched audio_id and both volumes")
+    check(ig.calls == [] and ig.published == [] and fb.published == ["c1"], "the Instagram Login client is not used")
+    check(e["music"]["audio_id"] == "587784541076604" and e["music"]["start"] == "0:10"
+          and e["music"]["start_applied"] is False, "the match is recorded; the start stays recorded, not applied")
+    e2 = music_reel("muted", music={"artist": "Kavinsky", "title": "Nightcall", "volume": None, "original_volume": 0})
+    fb2 = FakeMusicClient(catalogue=[NIGHTCALL])
+    quiet_run([e2], FakeClientAll(), music_client=fb2)
+    check(fb2.calls[0][1]["audio_configuration"] == {"audio_id": "587784541076604"},
+          "no volume set and the clip's sound removed: audio_id only (Meta's volumes are 1-100)")
+
+
+def test_allow_silent_posts_without_the_song_through_instagram_login():
+    e = music_reel(allow_silent=True)
+    ig = FakeClientAll()
+    published, out = quiet_run([e], ig, music_client=None)
+    check(len(published) == 1 and ig.calls[0][0] == "reel" and ig.calls[0][1].get("audio_configuration") is None,
+          "allow_silent: posted, without music, through Instagram Login")
+    check("posted without the song" in e["music"]["result"], "...and the entry says so")
+
+
+def test_entries_without_music_never_touch_the_facebook_client():
+    fb = FakeMusicClient(catalogue=[NIGHTCALL])
+    for e in (entry("art", NOW - timedelta(minutes=5)),
+              media_entry("r", "REELS", ["publish/r.mp4"], media_kinds=["video"], cover=None, thumb_offset=None,
+                          share_to_feed=True)):
+        ig = FakeClientAll() if e["media_type"] == "REELS" else FakeClient()
+        published, out = quiet_run([e], ig, music_client=fb)
+        check(len(published) == 1 and e.get("publish_via") is None, f"{e['media_type']}: posted as before")
+    check(fb.searches == [] and fb.calls == [] and fb.published == [], "the Facebook client was never called")
+
+
+def test_a_music_reel_still_needs_faces_passed():
+    e = music_reel()
+    del e["faces"]
+    fb = FakeMusicClient(catalogue=[NIGHTCALL])
+    published, out = quiet_run([e], FakeClientAll(), music_client=fb)
+    check(published == [] and e["status"] == "refused_faces" and fb.searches == [] and fb.calls == [],
+          "no faces: passed: refused before the song is even looked up")
+
+
+def test_music_lookup_errors():
+    e = music_reel()
+    fb = FakeMusicClient(search_error=ig_client.IGError(500, {"error": {"code": 2, "type": "Server"}}))
+    published, out = quiet_run([e], FakeClientAll(), music_client=fb)
+    check(e["status"] == "scheduled" and "will retry" in e["error"], "a transient lookup error: left scheduled")
+    e = music_reel()
+    other = entry("art", NOW - timedelta(minutes=1))
+    fb = FakeMusicClient(search_error=ig_client.IGError(400, {"error": {"code": 190, "type": "OAuthException"}}))
+    ig = FakeClient()
+    published, out = quiet_run([e, other], ig, music_client=fb)
+    check(e["status"] == "music_unavailable" and "refused the lookup" in e["error"],
+          "a dead Facebook token holds the music reel only...")
+    check([p["slug"] for p in published] == ["art"], "...and does not abort the run for everything else")
+
+
+def test_a_held_facebook_container_resumes_on_the_facebook_client():
+    e = music_reel(creation_id="c-fb", publish_via="facebook")
+    e["music"]["audio_id"] = "587784541076604"
+    fb, ig = FakeMusicClient(catalogue=[NIGHTCALL]), FakeClientAll()
+    published, out = quiet_run([e], ig, music_client=fb)
+    check(len(published) == 1 and fb.published == ["c-fb"] and ig.published == [] and fb.searches == [],
+          "a container made through Facebook Login is published there, not looked up again")
+    e = music_reel(creation_id="c-fb", publish_via="facebook")
+    published, out = quiet_run([e], FakeClientAll(), music_client=None)
+    check(e["status"] == "music_unavailable" and "Facebook" in e["error"], "...and held if that token is gone")
+
+
+def test_the_music_check_script():
+    import contextlib
+    import io
+    import music_check
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = music_check.main(["--artist", "Kavinsky", "--title", "Nightcall"],
+                                client=FakeMusicClient(catalogue=[NIGHTCALL, dict(NIGHTCALL, title="Nightcall (Live)",
+                                                                                     audio_id="9")]))
+    out = buf.getvalue()
+    check(code == 0 and "2 result(s)" in out and "EXACT MATCH" in out and "587784541076604" in out,
+          "it prints every result and the exact match")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = music_check.main(["--artist", "Kavinsky", "--title", "Nightcall"], client=FakeMusicClient(catalogue=[]))
+    check(code == 0 and "NO EXACT MATCH" in buf.getvalue() and "held" in buf.getvalue(), "no match: says it would be held")
+    old = {k: os.environ.pop(k, None) for k in ("FB_ACCESS_TOKEN", "FB_IG_USER_ID")}
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = music_check.main(["--artist", "a", "--title", "b"])
+        check(code == 2 and "must be set" in buf.getvalue(), "no token: exit 2, nothing called")
+    finally:
+        for k, v in old.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_the_facebook_client_and_the_workflow():
+    import yaml
+    sent = []
+
+    class Rec(ig_client.IGClient):
+        def __init__(self):
+            self.user_id = "IGB"
+            self.api = ig_client.FB_API
+
+        def _request(self, method, path, **kw):
+            sent.append((method, path, kw))
+            return {"audio": [NIGHTCALL], "id": "x"}
+    c = Rec()
+    found = c.search_audio("Kavinsky Nightcall")
+    check(found == [NIGHTCALL] and sent[0][:2] == ("GET", "ig_audio")
+          and sent[0][2]["params"] == {"audio_type": "music", "user_id": "IGB", "search_query": "Kavinsky Nightcall"},
+          "GET /ig_audio?audio_type=music&user_id=<IG business id>&search_query=<artist title>")
+    c.create_reel("https://v/r.mp4", "cap", audio_configuration={"audio_id": "1", "audio_volume": 80})
+    check(sent[1][2]["json"]["audio_configuration"] == {"audio_id": "1", "audio_volume": 80},
+          "audio_configuration goes in the reel's container")
+    check(ig_client.FB_API.startswith("https://graph.facebook.com/") and ig_client.API.startswith(
+        "https://graph.instagram.com/"), "music on graph.facebook.com; everything else stays on graph.instagram.com")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, ".github", "workflows", "music-check.yml"), encoding="utf-8") as fh:
+        text = fh.read()
+    wf = yaml.safe_load(text)
+    on = wf.get("on", wf.get(True))
+    check(set(on) == {"workflow_dispatch"} and set(on["workflow_dispatch"]["inputs"]) == {"artist", "title"},
+          "music-check: only by hand, with artist and title")
+    check(wf["permissions"] == {"contents": "read"} and "publish.py" not in text and "git push" not in text,
+          "it can read only, and never runs the publisher or pushes")
+    check("${{ inputs.artist }}" not in text.split("run:")[-1], "the inputs reach the script through env, not the script text")
+
+
 def main():
     test_selects_only_due_scheduled_entries()
     test_earliest_first_and_one_per_run()
@@ -512,6 +718,16 @@ def main():
     test_a_clip_still_processing_is_transient_and_resumes()
     test_an_unknown_media_type_fails_the_entry()
     test_the_client_sends_what_meta_documents()
+    test_a_music_reel_with_no_facebook_token_is_held()
+    test_a_music_reel_with_no_licensed_match_is_held_and_does_not_block_the_next()
+    test_a_music_reel_with_a_match_publishes_through_facebook_with_its_song()
+    test_allow_silent_posts_without_the_song_through_instagram_login()
+    test_entries_without_music_never_touch_the_facebook_client()
+    test_a_music_reel_still_needs_faces_passed()
+    test_music_lookup_errors()
+    test_a_held_facebook_container_resumes_on_the_facebook_client()
+    test_the_music_check_script()
+    test_the_facebook_client_and_the_workflow()
     print(f"\n{PASSED} checks passed")
 
 

@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ig_client import IGClient, IGError  # noqa: E402
+from ig_client import FB_API, IGClient, IGError  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QUEUE_DIR = os.path.join(REPO, "queue")
@@ -39,7 +39,8 @@ VIDEO_POLL_ATTEMPTS = 54
 
 # What this publisher can post. queue_post.py reads this line from origin/main before it queues anything, and
 # refuses a post whose type is not here (a reel queued before this publisher is deployed would fail at 19:00).
-SUPPORTS = ("IMAGE", "CAROUSEL", "CAROUSEL_VIDEO", "REELS", "STORIES", "ALT_TEXT")
+SUPPORTS = ("IMAGE", "CAROUSEL", "CAROUSEL_VIDEO", "REELS", "STORIES", "ALT_TEXT", "MUSIC")
+MUSIC_HELD = "music_unavailable"
 MEDIA_TYPES = ("IMAGE", "CAROUSEL", "REELS", "STORIES")
 
 AUTH_CODES = {190, 102, 463, 467}
@@ -142,6 +143,12 @@ def _create(entry: dict, client, checkpoint=None, sleep=None) -> str:
     if media_type == "REELS":
         cover = entry.get("cover")
         cover_url = f"{urls[0].rsplit('/', 1)[0]}/{os.path.basename(cover)}" if cover else None
+        music = entry.get("music") if isinstance(entry.get("music"), dict) else {}
+        if music.get("audio_id"):
+            return client.create_reel(urls[0], entry["caption"], cover_url=cover_url,
+                                      thumb_offset=entry.get("thumb_offset"),
+                                      share_to_feed=entry.get("share_to_feed"),
+                                      audio_configuration=audio_configuration(music))
         return client.create_reel(urls[0], entry["caption"], cover_url=cover_url,
                                   thumb_offset=entry.get("thumb_offset"),
                                   share_to_feed=entry.get("share_to_feed"))
@@ -151,6 +158,59 @@ def _create(entry: dict, client, checkpoint=None, sleep=None) -> str:
     if isinstance(alt, str) and alt.strip():
         return client.create_container(entry["media_url"], entry["caption"], alt_text=alt)
     return client.create_container(entry["media_url"], entry["caption"])
+
+
+def _norm(text) -> str:
+    """Titles and artists compare after NFKC, case-folding and collapsed spaces: an exact match, not a guess."""
+    import unicodedata
+    return " ".join(unicodedata.normalize("NFKC", str(text or "")).casefold().split())
+
+
+def find_music(client, artist: str, title: str) -> tuple[list[dict], list[dict]]:
+    """Search Meta's licensed catalogue for `artist` `title`. -> (every result, the exact matches): the same artist
+    and the same title, music only (never an original sound that happens to share the name)."""
+    found = client.search_audio(f"{artist} {title}", audio_type="music")
+    exact = [r for r in found if isinstance(r, dict) and str(r.get("audio_type") or "music").lower() == "music"
+             and _norm(r.get("display_artist")) == _norm(artist) and _norm(r.get("title")) == _norm(title)
+             and r.get("audio_id")]
+    return found, exact
+
+
+def audio_configuration(music: dict) -> dict:
+    """Meta's audio_configuration for the entry's song: audio_id, and the volumes (1-100) when they were set. An
+    original_volume of 0 means the queue tool already took the clip's sound out, so no video_volume is sent."""
+    conf = {"audio_id": str(music["audio_id"])}
+    if music.get("volume"):
+        conf["audio_volume"] = int(music["volume"])
+    if music.get("original_volume"):
+        conf["video_volume"] = int(music["original_volume"])
+    return conf
+
+
+def wants_music(entry: dict) -> bool:
+    return entry.get("media_type") == "REELS" and isinstance(entry.get("music"), dict)
+
+
+def attach_music(entry: dict, music_client) -> str | None:
+    """Find the entry's song and record its audio_id. -> None when found, else why not (a plain sentence).
+    Raises IGError only for a transient failure (the run retries later)."""
+    music = entry["music"]
+    if music_client is None:
+        return ("no Facebook Login token is set (FB_ACCESS_TOKEN and FB_IG_USER_ID); Meta's Audio API cannot be "
+                "reached through Instagram Login")
+    try:
+        _found, exact = find_music(music_client, music.get("artist", ""), music.get("title", ""))
+    except IGError as err:
+        if classify(err) == "transient":
+            raise
+        return f"the Audio API refused the lookup ({err})"
+    if not exact:
+        return (f"Instagram's licensed catalogue has no exact match for {music.get('artist')} - {music.get('title')} "
+                "(check it with the music-check workflow)")
+    music["audio_id"] = str(exact[0]["audio_id"])
+    music["matched"] = {"title": exact[0].get("title"), "display_artist": exact[0].get("display_artist"),
+                        "duration_in_ms": exact[0].get("duration_in_ms")}
+    return None
 
 
 def _is_video(entry: dict) -> bool:
@@ -192,7 +252,7 @@ def publish_entry(entry: dict, client, now: datetime, checkpoint=None,
 
 
 def run(entries: list[dict], client, now: datetime, dry_run: bool = False,
-        checkpoint=None, sleep=None) -> list[dict]:
+        checkpoint=None, sleep=None, music_client=None) -> list[dict]:
     published = []
     for entry in select_due(entries, now):
         # Standing rule 0.6: every publish path guards. Each path must check the
@@ -212,14 +272,46 @@ def run(entries: list[dict], client, now: datetime, dry_run: bool = False,
             entry["error"] = "over 24h late; reschedule by hand"
             print(f"stale: {entry['slug']}")
             continue
+        if wants_music(entry) and not dry_run:
+            # A reel's song is attached at creation, through Facebook Login, and cannot be added once it is live.
+            # No song (no token, no licensed match): HOLD the reel. Silent only when the entry says allow_silent.
+            if entry.get("publish_via") == "facebook" and entry.get("creation_id"):
+                if music_client is None:
+                    entry["status"] = MUSIC_HELD
+                    entry["error"] = ("music: its container was made through Facebook Login and no Facebook token "
+                                      "is set now; set FB_ACCESS_TOKEN and FB_IG_USER_ID, then status: scheduled")
+                    print(f"HELD {entry['slug']}: {entry['error']}")
+                    continue
+            elif not entry.get("creation_id"):
+                try:
+                    why = attach_music(entry, music_client)
+                except IGError as err:
+                    entry["error"] = f"music lookup, will retry: {err}"
+                    print(f"transient error looking up the music for {entry['slug']}, will retry: {err}")
+                    return published
+                if why and entry.get("allow_silent") is True:
+                    entry["music"]["result"] = f"posted without the song: {why}"
+                    print(f"{entry['slug']}: no song ({why}); allow_silent is set, so it posts without music")
+                elif why:
+                    entry["status"] = MUSIC_HELD
+                    entry["error"] = (f"music: {why}. The reel is held and is never posted silent; set allow_silent: "
+                                      "true to post it without the song, or fix the song and set status: scheduled")
+                    print(f"HELD {entry['slug']}: {entry['error']}")
+                    continue
+                else:
+                    entry["publish_via"] = "facebook"
         if dry_run:
+            if wants_music(entry):
+                print(f"DRY RUN: {entry['slug']} has music ({entry['music'].get('artist')} - "
+                      f"{entry['music'].get('title')}), looked up when it publishes")
             print(f"DRY RUN would publish {entry['slug']} ({entry.get('media_type')}, "
                   f"{len(entry.get('media') or [])} file(s))")
             print(f"  media_url: {entry['media_url']}")
             print(f"  caption:   {entry['caption'][:120]}...")
             return []
+        via = music_client if entry.get("publish_via") == "facebook" else client
         try:
-            if publish_entry(entry, client, now, checkpoint=checkpoint, sleep=sleep):
+            if publish_entry(entry, via, now, checkpoint=checkpoint, sleep=sleep):
                 published.append(entry)
                 print(f"published {entry['slug']} -> {entry['post_id']}")
             else:
@@ -310,6 +402,10 @@ def main() -> int:
         print("IG_ACCESS_TOKEN and IG_USER_ID must be set")
         return 2
     client = IGClient(user_id, token) if token else None
+    # Facebook Login, for a reel's song only (everything else keeps Instagram Login). Optional: without it a reel
+    # with music is held, never posted silent.
+    fb_token, fb_user = os.environ.get("FB_ACCESS_TOKEN", ""), os.environ.get("FB_IG_USER_ID", "")
+    music_client = IGClient(fb_user, fb_token, api=FB_API) if fb_token and fb_user else None
 
     def checkpoint(entry):
         """Commit and push the creation_id before media_publish is called."""
@@ -320,7 +416,7 @@ def main() -> int:
 
     try:
         published = run(entries, client, now, dry_run=args.dry_run,
-                        checkpoint=checkpoint)
+                        checkpoint=checkpoint, music_client=music_client)
     except AuthAborted as exc:
         print(f"AUTH FAILURE, aborting run without failing any entry: {exc}")
         return 3

@@ -12,6 +12,10 @@ from __future__ import annotations
 import requests
 
 API = "https://graph.instagram.com/v25.0"
+# Instagram API with Facebook Login: the only path that takes a reel's licensed song (Audio API, read 2026-11-04,
+# https://developers.facebook.com/docs/instagram-platform/content-publishing/audio-api/). Same calls, other host,
+# a Facebook token, and the Instagram business account id found through the linked Page.
+FB_API = "https://graph.facebook.com/v26.0"
 TIMEOUT = 30
 
 
@@ -29,14 +33,15 @@ class IGError(Exception):
 
 
 class IGClient:
-    def __init__(self, user_id: str, token: str):
+    def __init__(self, user_id: str, token: str, api: str = API):
         self.user_id = user_id
+        self.api = api
         self._session = requests.Session()
         self._session.headers["Authorization"] = f"Bearer {token}"
 
     def _request(self, method: str, path: str, **kwargs) -> dict:
         try:
-            resp = self._session.request(method, f"{API}/{path}",
+            resp = self._session.request(method, f"{self.api}/{path}",
                                          timeout=TIMEOUT, **kwargs)
         except requests.RequestException as exc:
             # Re-raise without the original, whose text can contain the URL.
@@ -93,9 +98,13 @@ class IGClient:
         return data["id"]
 
     def create_reel(self, video_url: str, caption: str, cover_url: str | None = None,
-                    thumb_offset: int | None = None, share_to_feed: bool | None = None) -> str:
-        """A reel. A cover_url wins over thumb_offset (ms into the clip)."""
+                    thumb_offset: int | None = None, share_to_feed: bool | None = None,
+                    audio_configuration: dict | None = None) -> str:
+        """A reel. A cover_url wins over thumb_offset (ms into the clip). `audio_configuration` ({audio_id,
+        audio_volume, video_volume}) attaches a licensed song: Facebook Login only, and only at creation."""
         body = {"media_type": "REELS", "video_url": video_url, "caption": caption}
+        if audio_configuration:
+            body["audio_configuration"] = audio_configuration
         if cover_url:
             body["cover_url"] = cover_url
         elif thumb_offset is not None:
@@ -108,6 +117,14 @@ class IGClient:
         """A story: one picture or one clip. Meta takes no caption on a story."""
         body = {"media_type": "STORIES", ("video_url" if kind == "video" else "image_url"): url}
         return self._request("POST", f"{self.user_id}/media", json=body)["id"]
+
+    def search_audio(self, query: str, audio_type: str = "music") -> list[dict]:
+        """Meta's Audio API: the songs (audio_type=music) authorized for third-party use that match `query` (title
+        and artist). Facebook Login only. -> [{audio_id, title, display_artist, duration_in_ms, audio_type, ...}]"""
+        data = self._request("GET", "ig_audio", params={"audio_type": audio_type, "user_id": self.user_id,
+                                                         "search_query": query})
+        found = data.get("audio", data.get("data", []))
+        return found if isinstance(found, list) else []
 
     def container_status(self, container_id: str) -> str:
         """EXPIRED | ERROR | FINISHED | IN_PROGRESS | PUBLISHED."""
