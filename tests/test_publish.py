@@ -292,6 +292,196 @@ def test_a_photo_entry_skips_the_gallery():
             publish.GALLERY = old
 
 
+# ---------------------------------------------------------------- every type Meta's API takes
+# Carousels of pictures and clips (with alt text on the pictures), reels, stories, alt text on a single picture.
+
+class FakeClientAll(FakeClient):
+    """Records every create call with its arguments. `statuses` maps a container id to the statuses it reports in
+    turn (a clip is IN_PROGRESS for a while); the last one repeats."""
+
+    def __init__(self, statuses=None, **kw):
+        super().__init__(**kw)
+        self.calls = []
+        self.statuses = statuses or {}
+        self.polled = []
+
+    def _new(self, what, **args):
+        self.calls.append((what, args))
+        self.created.append(what)
+        return f"c{len(self.created)}"
+
+    def create_container(self, image_url, caption, alt_text=None):
+        return self._new("image", url=image_url, caption=caption, alt_text=alt_text)
+
+    def create_carousel(self, child_urls, caption):
+        return self._new("old-carousel", urls=list(child_urls), caption=caption)
+
+    def create_carousel_item(self, url, kind="image", alt_text=None):
+        return self._new("item", url=url, kind=kind, alt_text=alt_text)
+
+    def create_carousel_container(self, children, caption):
+        return self._new("carousel", children=list(children), caption=caption)
+
+    def create_reel(self, video_url, caption, cover_url=None, thumb_offset=None, share_to_feed=None):
+        return self._new("reel", url=video_url, caption=caption, cover_url=cover_url, thumb_offset=thumb_offset,
+                         share_to_feed=share_to_feed)
+
+    def create_story(self, url, kind="image"):
+        return self._new("story", url=url, kind=kind)
+
+    def container_status(self, container_id):
+        self.polled.append(container_id)
+        seq = self.statuses.get(container_id) or ["FINISHED"]
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+
+def media_entry(slug, media_type, media, **over):
+    e = entry(slug, NOW - timedelta(minutes=5), media_type=media_type, media=media,
+              media_url=f"https://raw/x/sha/{media[0]}", gallery=False)
+    e.update(over)
+    return e
+
+
+def test_the_supports_line_names_every_type():
+    check(set(publish.SUPPORTS) == {"IMAGE", "CAROUSEL", "CAROUSEL_VIDEO", "REELS", "STORIES", "ALT_TEXT"},
+          "SUPPORTS names every post type (queue_post.py reads it from origin/main)")
+
+
+def test_a_carousel_of_pictures_and_clips_with_alt_text():
+    e = media_entry("ch", "CAROUSEL", ["publish/ch-01.jpg", "publish/ch-02.mp4", "publish/ch-03.jpg"],
+                    media_kinds=["image", "video", "image"], alt=["A ridge.", "", ""])
+    client = FakeClientAll(statuses={"c2": ["IN_PROGRESS", "IN_PROGRESS", "FINISHED"]})
+    saves, slept = [], []
+    published = publish.run([e], client, NOW, checkpoint=lambda x: saves.append(dict(x)),
+                            sleep=lambda s: slept.append(s))
+    items = [a for w, a in client.calls if w == "item"]
+    check(len(published) == 1 and e["status"] == "published", "published")
+    check([i["kind"] for i in items] == ["image", "video", "image"]
+          and items[1]["url"] == "https://raw/x/sha/publish/ch-02.mp4", "one child per file, a clip as a video child")
+    check(items[0]["alt_text"] == "A ridge." and items[1]["alt_text"] is None and items[2]["alt_text"] is None,
+          "alt text on the pictures that have one, never on a clip")
+    carousel = next(a for w, a in client.calls if w == "carousel")
+    check(carousel["children"] == ["c1", "c2", "c3"] and carousel["caption"] == e["caption"],
+          "the carousel container is made from the children, with the caption")
+    check(saves and saves[0]["children_ids"] == ["c1", "c2", "c3"] and saves[0]["creation_id"] is None,
+          "the children are checkpointed before the wait (a crash reuses them)")
+    check(slept and set(slept) == {publish.VIDEO_POLL_SECONDS}, "the clip child is waited for at the video pace")
+    check(e["creation_id"] == "c4" and e["post_id"] == "post-c4", "creation and post ids recorded")
+
+
+def test_children_are_reused_after_a_crash():
+    e = media_entry("ch", "CAROUSEL", ["publish/ch-01.jpg", "publish/ch-02.jpg"], media_kinds=["image", "image"],
+                    alt=["", ""], children_ids=["k1", "k2"])
+    client = FakeClientAll()
+    publish.run([e], client, NOW)
+    check([w for w, _ in client.calls] == ["carousel"] and client.calls[0][1]["children"] == ["k1", "k2"],
+          "no child is made twice: the checkpointed ones are used")
+
+
+def test_an_older_picture_carousel_entry_takes_the_old_call():
+    e = media_entry("old", "CAROUSEL", ["publish/old-1.jpg", "publish/old-2.jpg"])
+    client = FakeClientAll()
+    publish.run([e], client, NOW)
+    check([w for w, _ in client.calls] == ["old-carousel"], "an entry with no media_kinds is posted exactly as before")
+
+
+def test_a_reel():
+    e = media_entry("r", "REELS", ["publish/r.mp4"], media_kinds=["video"], cover="publish/r-cover.jpg",
+                    thumb_offset=None, share_to_feed=True)
+    client = FakeClientAll(statuses={"c1": ["IN_PROGRESS", "FINISHED"]})
+    slept = []
+    published = publish.run([e], client, NOW, sleep=lambda s: slept.append(s))
+    w, a = client.calls[0]
+    check(len(published) == 1 and w == "reel" and a["url"] == "https://raw/x/sha/publish/r.mp4", "a REELS container")
+    check(a["cover_url"] == "https://raw/x/sha/publish/r-cover.jpg" and a["share_to_feed"] is True, "cover and feed share")
+    check(slept == [publish.VIDEO_POLL_SECONDS], "waited for at the video pace")
+    e2 = media_entry("r2", "REELS", ["publish/r2.mp4"], media_kinds=["video"], cover=None, thumb_offset=1500,
+                     share_to_feed=False)
+    client = FakeClientAll()
+    publish.run([e2], client, NOW)
+    check(client.calls[0][1]["thumb_offset"] == 1500 and client.calls[0][1]["cover_url"] is None
+          and client.calls[0][1]["share_to_feed"] is False, "thumb offset when there is no cover")
+
+
+def test_stories():
+    for media, kind in ((["publish/s.jpg"], "image"), (["publish/s.mp4"], "video")):
+        e = media_entry("s", "STORIES", media, media_kinds=[kind], caption="")
+        client = FakeClientAll()
+        published = publish.run([e], client, NOW, sleep=lambda s: None)
+        check(len(published) == 1 and client.calls[0] == ("story", {"url": f"https://raw/x/sha/{media[0]}",
+                                                                    "kind": kind}), f"a {kind} story")
+
+
+def test_a_story_already_published_is_adopted_not_posted_twice():
+    e = media_entry("s", "STORIES", ["publish/s.jpg"], media_kinds=["image"], caption="", creation_id="c-held")
+    client = FakeClientAll(statuses={"c-held": ["PUBLISHED"]}, existing=[{"id": "other", "caption": ""}])
+    published = publish.run([e], client, NOW)
+    check(published == [] and client.published == [] and e["status"] == "published",
+          "its container says PUBLISHED: adopted, no second media_publish")
+    check(e["post_id"] is None, "an empty caption never matches some other post")
+
+
+def test_a_single_picture_sends_its_alt_text():
+    e = media_entry("p", "IMAGE", ["publish/p.jpg"], alt="Red rock ridge under a clear sky")
+    client = FakeClientAll()
+    publish.run([e], client, NOW)
+    check(client.calls[0][1]["alt_text"] == "Red rock ridge under a clear sky", "alt text sent with the picture")
+    e = entry("art", NOW - timedelta(minutes=5))
+    client = FakeClient()
+    publish.run([e], client, NOW)
+    check(client.published == ["c1"], "an entry with no alt is posted with the old two-argument call")
+
+
+def test_a_clip_still_processing_is_transient_and_resumes():
+    e = media_entry("r", "REELS", ["publish/r.mp4"], media_kinds=["video"], cover=None, thumb_offset=None,
+                    share_to_feed=True)
+    client = FakeClientAll(statuses={"c1": ["IN_PROGRESS"]})
+    publish.run([e], client, NOW, sleep=lambda s: None)
+    check(e["status"] == "scheduled" and e["creation_id"] == "c1" and "never finished" in (e["error"] or ""),
+          "still processing after the wait: left scheduled, its container kept")
+    check(len(client.polled) == publish.VIDEO_POLL_ATTEMPTS, "polled for the whole video budget")
+    client2 = FakeClientAll()
+    published = publish.run([e], client2, NOW)
+    check(len(published) == 1 and [w for w, _ in client2.calls] == [], "the next run publishes it, making nothing new")
+
+
+def test_an_unknown_media_type_fails_the_entry():
+    e = media_entry("x", "IGTV", ["publish/x.mp4"])
+    client = FakeClientAll()
+    publish.run([e], client, NOW)
+    check(e["status"] == "failed" and "unknown media_type" in e["error"] and client.calls == [], "refused, nothing made")
+
+
+def test_the_client_sends_what_meta_documents():
+    sent = []
+
+    class Rec(ig_client.IGClient):
+        def __init__(self):
+            self.user_id = "U"
+
+        def _request(self, method, path, **kw):
+            sent.append((method, path, kw.get("json")))
+            return {"id": f"id{len(sent)}"}
+    c = Rec()
+    c.create_container("https://i/1.jpg", "cap", alt_text="alt")
+    c.create_carousel_item("https://i/2.jpg", "image", alt_text="alt2")
+    c.create_carousel_item("https://i/3.mp4", "video", alt_text="ignored")
+    c.create_carousel_container(["a", "b"], "cap")
+    c.create_reel("https://i/4.mp4", "cap", cover_url="https://i/c.jpg", thumb_offset=99, share_to_feed=True)
+    c.create_story("https://i/5.mp4", "video")
+    bodies = [b for _, _, b in sent]
+    check(all(m == "POST" and p == "U/media" for m, p, _ in sent), "every create is POST /<user>/media")
+    check(bodies[0] == {"image_url": "https://i/1.jpg", "caption": "cap", "alt_text": "alt"}, "an image with alt_text")
+    check(bodies[1] == {"is_carousel_item": True, "image_url": "https://i/2.jpg", "alt_text": "alt2"},
+          "a picture child with alt_text")
+    check(bodies[2] == {"is_carousel_item": True, "media_type": "VIDEO", "video_url": "https://i/3.mp4"},
+          "a clip child: media_type VIDEO, video_url, no alt_text")
+    check(bodies[3] == {"media_type": "CAROUSEL", "children": "a,b", "caption": "cap"}, "the carousel container")
+    check(bodies[4] == {"media_type": "REELS", "video_url": "https://i/4.mp4", "caption": "cap",
+                        "cover_url": "https://i/c.jpg", "share_to_feed": True}, "a reel: the cover wins over the offset")
+    check(bodies[5] == {"media_type": "STORIES", "video_url": "https://i/5.mp4"}, "a story: no caption")
+
+
 def main():
     test_selects_only_due_scheduled_entries()
     test_earliest_first_and_one_per_run()
@@ -311,6 +501,17 @@ def main():
     test_due_entry_with_faces_passed_publishes_as_before()
     test_not_due_entry_without_faces_is_untouched()
     test_a_photo_entry_skips_the_gallery()
+    test_the_supports_line_names_every_type()
+    test_a_carousel_of_pictures_and_clips_with_alt_text()
+    test_children_are_reused_after_a_crash()
+    test_an_older_picture_carousel_entry_takes_the_old_call()
+    test_a_reel()
+    test_stories()
+    test_a_story_already_published_is_adopted_not_posted_twice()
+    test_a_single_picture_sends_its_alt_text()
+    test_a_clip_still_processing_is_transient_and_resumes()
+    test_an_unknown_media_type_fails_the_entry()
+    test_the_client_sends_what_meta_documents()
     print(f"\n{PASSED} checks passed")
 
 

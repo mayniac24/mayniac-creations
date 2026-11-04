@@ -32,6 +32,15 @@ GALLERY = os.path.join(REPO, "data", "gallery.json")
 STALE_AFTER = timedelta(hours=24)
 CONTAINER_POLL_SECONDS = 5
 CONTAINER_POLL_ATTEMPTS = 12
+# A video container (a reel, a story clip, a carousel clip) takes Meta minutes to process. Wait up to 9 minutes in
+# one run; past that the error is transient, the creation_id is already pushed, and the next run picks it up.
+VIDEO_POLL_SECONDS = 10
+VIDEO_POLL_ATTEMPTS = 54
+
+# What this publisher can post. queue_post.py reads this line from origin/main before it queues anything, and
+# refuses a post whose type is not here (a reel queued before this publisher is deployed would fail at 19:00).
+SUPPORTS = ("IMAGE", "CAROUSEL", "CAROUSEL_VIDEO", "REELS", "STORIES", "ALT_TEXT")
+MEDIA_TYPES = ("IMAGE", "CAROUSEL", "REELS", "STORIES")
 
 AUTH_CODES = {190, 102, 463, 467}
 TRANSIENT_CODES = {1, 2, 4, 17, 32, 341}
@@ -73,18 +82,79 @@ def gallery_piece(entry: dict) -> dict:
     return piece
 
 
-def _wait_for_container(client, container_id: str, sleep=None) -> None:
-    """An image container is not guaranteed ready the instant /media returns."""
+def _wait_for_container(client, container_id: str, sleep=None, video: bool = False) -> None:
+    """A container is not guaranteed ready the instant /media returns; a video one takes minutes."""
     sleep = sleep or time.sleep
-    for _ in range(CONTAINER_POLL_ATTEMPTS):
+    attempts, seconds = ((VIDEO_POLL_ATTEMPTS, VIDEO_POLL_SECONDS) if video
+                         else (CONTAINER_POLL_ATTEMPTS, CONTAINER_POLL_SECONDS))
+    for _ in range(attempts):
         status = client.container_status(container_id)
         if status in ("FINISHED", "PUBLISHED"):
             return
         if status in ("ERROR", "EXPIRED"):
             raise IGError(400, {"error": {"code": 100,
                                           "message": f"container {status}"}})
-        sleep(CONTAINER_POLL_SECONDS)
+        sleep(seconds)
     raise IGError(0, {"error": {"code": 2, "message": "container never finished"}})
+
+
+def _media_urls(entry: dict) -> list[str]:
+    """Every published file's URL: media_url is the first, SHA-pinned; the rest sit beside it."""
+    base = entry["media_url"].rsplit("/", 1)[0]
+    return [f"{base}/{os.path.basename(m)}" for m in entry["media"]]
+
+
+def _kinds(entry: dict) -> list[str]:
+    kinds = entry.get("media_kinds")
+    if isinstance(kinds, list) and len(kinds) == len(entry["media"]):
+        return [str(k) for k in kinds]
+    return ["video" if str(m).lower().endswith((".mp4", ".mov")) else "image" for m in entry["media"]]
+
+
+def _alts(entry: dict) -> list:
+    alts = entry.get("alt")
+    if isinstance(alts, list) and len(alts) == len(entry["media"]):
+        return [a if isinstance(a, str) and a.strip() else None for a in alts]
+    return [None] * len(entry["media"])
+
+
+def _create(entry: dict, client, checkpoint=None, sleep=None) -> str:
+    """Make the post's container (and a carousel's children) -> its creation_id."""
+    media_type = entry.get("media_type")
+    if media_type not in MEDIA_TYPES:
+        raise IGError(400, {"error": {"code": 100, "message": f"unknown media_type {media_type!r}"}})
+    urls, kinds = _media_urls(entry), _kinds(entry)
+    if media_type == "CAROUSEL":
+        if "media_kinds" not in entry and not isinstance(entry.get("alt"), list):
+            return client.create_carousel(urls, entry["caption"])     # an entry from before media_kinds
+        children = entry.get("children_ids")
+        if not (isinstance(children, list) and len(children) == len(urls)):
+            alts = _alts(entry)
+            children = [client.create_carousel_item(u, kind=k, alt_text=a if k == "image" else None)
+                        for u, k, a in zip(urls, kinds, alts)]
+            entry["children_ids"] = children
+            if checkpoint:          # children are reused by the next run if this one dies while they process
+                checkpoint(entry)
+        for child, kind in zip(children, kinds):
+            if kind == "video":
+                _wait_for_container(client, child, sleep=sleep, video=True)
+        return client.create_carousel_container(children, entry["caption"])
+    if media_type == "REELS":
+        cover = entry.get("cover")
+        cover_url = f"{urls[0].rsplit('/', 1)[0]}/{os.path.basename(cover)}" if cover else None
+        return client.create_reel(urls[0], entry["caption"], cover_url=cover_url,
+                                  thumb_offset=entry.get("thumb_offset"),
+                                  share_to_feed=entry.get("share_to_feed"))
+    if media_type == "STORIES":
+        return client.create_story(urls[0], kind=kinds[0])
+    alt = entry.get("alt")
+    if isinstance(alt, str) and alt.strip():
+        return client.create_container(entry["media_url"], entry["caption"], alt_text=alt)
+    return client.create_container(entry["media_url"], entry["caption"])
+
+
+def _is_video(entry: dict) -> bool:
+    return entry.get("media_type") in ("REELS", "STORIES", "CAROUSEL") and "video" in _kinds(entry)
 
 
 def publish_entry(entry: dict, client, now: datetime, checkpoint=None,
@@ -92,28 +162,28 @@ def publish_entry(entry: dict, client, now: datetime, checkpoint=None,
     """Publish one entry. Returns True if a post went out on this call."""
     # Crash recovery: an entry holding a creation_id must never be re-created.
     if entry.get("creation_id"):
-        for post in client.recent_media():
-            if post.get("caption") == entry["caption"]:
-                entry["post_id"] = post["id"]
-                entry["published_at"] = now.isoformat()
-                entry["status"] = "published"
-                return False
+        caption = entry.get("caption") or ""
+        if caption:                 # a story has no caption, and is not in /media: its container says instead
+            for post in client.recent_media():
+                if post.get("caption") == caption:
+                    entry["post_id"] = post["id"]
+                    entry["published_at"] = now.isoformat()
+                    entry["status"] = "published"
+                    return False
         creation_id = entry["creation_id"]
+        if entry.get("media_type") == "STORIES" and client.container_status(creation_id) == "PUBLISHED":
+            entry["published_at"] = now.isoformat()
+            entry["status"] = "published"
+            return False
     else:
-        if entry["media_type"] == "CAROUSEL":
-            base = entry["media_url"].rsplit("/", 1)[0]
-            urls = [f"{base}/{os.path.basename(m)}" for m in entry["media"]]
-            creation_id = client.create_carousel(urls, entry["caption"])
-        else:
-            creation_id = client.create_container(entry["media_url"],
-                                                  entry["caption"])
+        creation_id = _create(entry, client, checkpoint=checkpoint, sleep=sleep)
         entry["creation_id"] = creation_id
         # Persist and PUSH before media_publish. A marker written to the
         # runner's working copy dies with the runner.
         if checkpoint:
             checkpoint(entry)
 
-    _wait_for_container(client, creation_id, sleep=sleep)
+    _wait_for_container(client, creation_id, sleep=sleep, video=_is_video(entry))
     entry["post_id"] = client.publish(creation_id)
     entry["published_at"] = now.isoformat()
     entry["status"] = "published"
@@ -143,8 +213,9 @@ def run(entries: list[dict], client, now: datetime, dry_run: bool = False,
             print(f"stale: {entry['slug']}")
             continue
         if dry_run:
-            print(f"DRY RUN would publish {entry['slug']}")
-            print(f"  image_url: {entry['media_url']}")
+            print(f"DRY RUN would publish {entry['slug']} ({entry.get('media_type')}, "
+                  f"{len(entry.get('media') or [])} file(s))")
+            print(f"  media_url: {entry['media_url']}")
             print(f"  caption:   {entry['caption'][:120]}...")
             return []
         try:

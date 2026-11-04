@@ -53,9 +53,12 @@ class IGClient:
     def me(self) -> dict:
         return self._request("GET", "me", params={"fields": "id,username"})
 
-    def create_container(self, image_url: str, caption: str) -> str:
-        data = self._request("POST", f"{self.user_id}/media",
-                             json={"image_url": image_url, "caption": caption})
+    def create_container(self, image_url: str, caption: str, alt_text: str | None = None) -> str:
+        """A single-image post. `alt_text` (up to 1000 characters) is Meta's, for images only."""
+        body = {"image_url": image_url, "caption": caption}
+        if alt_text:
+            body["alt_text"] = alt_text
+        data = self._request("POST", f"{self.user_id}/media", json=body)
         return data["id"]
 
     def create_carousel(self, child_urls: list[str], caption: str) -> str:
@@ -69,6 +72,42 @@ class IGClient:
                                    "children": ",".join(children),
                                    "caption": caption})
         return data["id"]
+
+    def create_carousel_item(self, url: str, kind: str = "image", alt_text: str | None = None) -> str:
+        """One carousel child: a picture (image_url, with its alt text) or a clip (media_type VIDEO, video_url).
+        A reel cannot be a carousel item; video children take no alt text."""
+        body = {"is_carousel_item": True}
+        if kind == "video":
+            body.update(media_type="VIDEO", video_url=url)
+        else:
+            body["image_url"] = url
+            if alt_text:
+                body["alt_text"] = alt_text
+        return self._request("POST", f"{self.user_id}/media", json=body)["id"]
+
+    def create_carousel_container(self, children: list[str], caption: str) -> str:
+        """The carousel itself, from up to 20 finished child containers."""
+        data = self._request("POST", f"{self.user_id}/media",
+                             json={"media_type": "CAROUSEL", "children": ",".join(children),
+                                   "caption": caption})
+        return data["id"]
+
+    def create_reel(self, video_url: str, caption: str, cover_url: str | None = None,
+                    thumb_offset: int | None = None, share_to_feed: bool | None = None) -> str:
+        """A reel. A cover_url wins over thumb_offset (ms into the clip)."""
+        body = {"media_type": "REELS", "video_url": video_url, "caption": caption}
+        if cover_url:
+            body["cover_url"] = cover_url
+        elif thumb_offset is not None:
+            body["thumb_offset"] = int(thumb_offset)
+        if share_to_feed is not None:
+            body["share_to_feed"] = bool(share_to_feed)
+        return self._request("POST", f"{self.user_id}/media", json=body)["id"]
+
+    def create_story(self, url: str, kind: str = "image") -> str:
+        """A story: one picture or one clip. Meta takes no caption on a story."""
+        body = {"media_type": "STORIES", ("video_url" if kind == "video" else "image_url"): url}
+        return self._request("POST", f"{self.user_id}/media", json=body)["id"]
 
     def container_status(self, container_id: str) -> str:
         """EXPIRED | ERROR | FINISHED | IN_PROGRESS | PUBLISHED."""
